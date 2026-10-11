@@ -1,0 +1,20 @@
+{
+  "name": "commitopsy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Find what changed before your deployment broke.",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/api"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @commitopsy/api",
+    "build": "npm run build --workspace @commitopsy/api",
+    "typecheck": "npm run typecheck --workspace @commitopsy/api",
+    "test": "npm run test --workspace @commitopsy/api",
+    "test:watch": "npm run test:watch --workspace @commitopsy/api",
+    "db:migrate": "npm run db:migrate --workspace @commitopsy/api"
+  }
+}
