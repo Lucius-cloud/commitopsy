@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output and test artifacts
+**/dist/
+coverage/
+.playwright/
+playwright-report/
+test-results/
+
+# Environment secrets: keep .env.example files tracked
+.env
+.env.*
+!.env.example
+
+# Logs and local data
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/
+.idea/
