@@ -49,12 +49,18 @@ function pushPayload() {
 async function postGithubEvent(
   app: ReturnType<typeof createApp>,
   payload: unknown,
-  options: { deliveryId?: string; eventName?: string; signatureSecret?: string | null; rawBody?: string } = {}
+  options: { deliveryId?: string; eventName?: string; signatureSecret?: string | null; rawBody?: string; signatureBody?: string;
+ } = {}
 ) {
-  const rawBody = options.rawBody ?? JSON.stringify(payload);
-  const signature = options.signatureSecret === null
-    ? undefined
-    : signPayload(Buffer.from(rawBody), options.signatureSecret ?? SECRET);
+const rawBody = options.rawBody ?? JSON.stringify(payload);
+const signatureBody = options.signatureBody ?? rawBody;
+
+const signature = options.signatureSecret === null
+  ? undefined
+  : signPayload(
+      Buffer.from(signatureBody),
+      options.signatureSecret ?? SECRET,
+    );
   let req = request(app)
     .post("/api/webhooks/github")
     .set("content-type", "application/json")
@@ -81,6 +87,24 @@ describe("POST /api/webhooks/github", () => {
     expect(stored?.summary.commitCount).toBe(1);
     expect(stored).not.toHaveProperty("payload");
   });
+  it("rejects a body that differs from the signed bytes", async () => {
+  const { app, repository } = createTestContext();
+
+  const originalBody = JSON.stringify(pushPayload());
+  const modifiedBody = JSON.stringify({
+    ...pushPayload(),
+    ref: "refs/heads/feature",
+  });
+
+  const response = await postGithubEvent(app, pushPayload(), {
+    rawBody: modifiedBody,
+    signatureBody: originalBody,
+  });
+
+  expect(response.status).toBe(401);
+  expect(response.body.error).toBe("invalid_webhook_signature");
+  expect(repository.events.size).toBe(0);
+});
 
   it("rejects requests without a signature", async () => {
     const { app, repository } = createTestContext();
@@ -90,6 +114,20 @@ describe("POST /api/webhooks/github", () => {
     expect(response.body.error).toBe("invalid_webhook_signature");
     expect(repository.events.size).toBe(0);
   });
+
+  it("rejects a signed push payload that fails schema validation", async () => {
+  const { app, repository } = createTestContext();
+
+  const response = await postGithubEvent(app, {
+    repository: {
+      full_name: "example/demo-app",
+    },
+  });
+
+  expect(response.status).toBe(400);
+  expect(response.body.error).toBe("invalid_event_payload");
+  expect(repository.events.size).toBe(0);
+});
 
   it("rejects a signature generated with the wrong secret", async () => {
     const { app } = createTestContext();
