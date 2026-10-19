@@ -16,6 +16,7 @@
     "test": "npm run test --workspace @commitopsy/api",
     "test:watch": "npm run test:watch --workspace @commitopsy/api",
     "test:integration": "npm run test:integration --workspace @commitopsy/api",
+    "db:generate": "npm run db:generate --workspace @commitopsy/api",
   "db:migrate": "npm run db:migrate --workspace @commitopsy/api"
   }
 }
