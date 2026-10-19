@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 
 import { createHmac, randomUUID } from "node:crypto";
@@ -9,7 +10,11 @@ import { eq } from "drizzle-orm";
 
 import * as schema from "../../src/db/schema.js";
 import { createApp } from "../../src/app.js";
-import { DrizzleGithubEventRepository } from "../../src/db/event-repository.js";
+import {
+  DrizzleGithubEventRepository,
+  type GithubEventRepository,
+  type NewGithubEvent
+} from "../../src/db/event-repository.js";
 import { githubEvents } from "../../src/db/schema.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -57,9 +62,10 @@ const app = createApp({
   }
 });
 
-// Use separate delivery IDs so the two tests cannot affect each other.
+// Use separate delivery IDs so tests cannot affect one another.
 const deliveryId = randomUUID();
 const concurrentDeliveryId = randomUUID();
+const retryDeliveryId = randomUUID();
 
 const payload = {
   ref: "refs/heads/main",
@@ -91,8 +97,11 @@ const signature = `sha256=${createHmac("sha256", webhookSecret)
   .update(Buffer.from(rawBody))
   .digest("hex")}`;
 
-function sendSignedWebhook(requestDeliveryId: string = deliveryId) {
-  return request(app)
+function sendSignedWebhook(
+  requestDeliveryId: string = deliveryId,
+  targetApp: ReturnType<typeof createApp> = app
+) {
+  return request(targetApp)
     .post("/api/webhooks/github")
     .set("content-type", "application/json")
     .set("x-github-event", "push")
@@ -122,6 +131,10 @@ describe("GitHub webhook PostgreSQL integration", () => {
         await db
           .delete(githubEvents)
           .where(eq(githubEvents.deliveryId, concurrentDeliveryId));
+
+        await db
+          .delete(githubEvents)
+          .where(eq(githubEvents.deliveryId, retryDeliveryId));
       }
     } finally {
       // Always release PostgreSQL connections.
@@ -179,22 +192,21 @@ describe("GitHub webhook PostgreSQL integration", () => {
   it("persists concurrent duplicate deliveries exactly once", async () => {
     const requestCount = 10;
 
-    // Launch all ten requests without awaiting any individual request.
-    // They share the same body, signature and delivery ID.
+    // Launch all ten requests concurrently with the same delivery ID.
     const responses = await Promise.all(
       Array.from({ length: requestCount }, () =>
         sendSignedWebhook(concurrentDeliveryId)
       )
     );
 
-    // Every request should receive the documented acknowledgement.
     expect(responses).toHaveLength(requestCount);
 
+    // Every valid delivery should be acknowledged.
     expect(
       responses.every((response) => response.status === 202)
     ).toBe(true);
 
-    // Every response should acknowledge receipt of the same delivery.
+    // Every response must refer to the same delivery.
     expect(
       responses.every(
         (response) =>
@@ -203,17 +215,17 @@ describe("GitHub webhook PostgreSQL integration", () => {
       )
     ).toBe(true);
 
-    // Exactly one concurrent request must insert the event.
+    // Exactly one request inserts the event.
     expect(
       responses.filter((response) => response.body.duplicate === false)
     ).toHaveLength(1);
 
-    // The other nine requests must be identified as duplicates.
+    // The other nine requests are acknowledged as duplicates.
     expect(
       responses.filter((response) => response.body.duplicate === true)
     ).toHaveLength(requestCount - 1);
 
-    // Verify the actual PostgreSQL state, not just the HTTP responses.
+    // Verify the actual PostgreSQL state.
     const rows = await db
       .select()
       .from(githubEvents)
@@ -223,6 +235,83 @@ describe("GitHub webhook PostgreSQL integration", () => {
 
     expect(rows[0]).toMatchObject({
       deliveryId: concurrentDeliveryId,
+      eventName: "push",
+      repositoryId: "987654321",
+      repositoryFullName: "commitopsy-integration/idempotency-test"
+    });
+  });
+
+  it("returns a safe error on persistence failure and accepts a retry", async () => {
+    let shouldFail = true;
+
+    // Inject one transient failure before delegating to the real repository.
+    const failOnceRepository: GithubEventRepository = {
+      async saveOnce(event: NewGithubEvent): Promise<boolean> {
+        if (shouldFail) {
+          shouldFail = false;
+          throw new Error("simulated database write failure");
+        }
+
+        return repository.saveOnce(event);
+      }
+    };
+
+    // Use the real Express application with the test repository injected.
+    const retryApp = createApp({
+      githubWebhookSecret: webhookSecret!,
+      eventRepository: failOnceRepository,
+      readinessCheck: async () => {
+        await pool.query("SELECT 1");
+      }
+    });
+
+    // First attempt: the repository fails before persisting the event.
+    const failedResponse = await sendSignedWebhook(
+      retryDeliveryId,
+      retryApp
+    );
+
+    expect(failedResponse.status).toBe(500);
+    expect(failedResponse.body).toEqual({
+      error: "internal_server_error"
+    });
+
+    // The internal exception must not be returned to the client.
+    expect(JSON.stringify(failedResponse.body)).not.toContain(
+      "simulated database write failure"
+    );
+
+    // Confirm that the failed attempt created no database row.
+    const rowsAfterFailure = await db
+      .select()
+      .from(githubEvents)
+      .where(eq(githubEvents.deliveryId, retryDeliveryId));
+
+    expect(rowsAfterFailure).toHaveLength(0);
+
+    // Retry the same event with the same delivery ID and signed body.
+    const retryResponse = await sendSignedWebhook(
+      retryDeliveryId,
+      retryApp
+    );
+
+    expect(retryResponse.status).toBe(202);
+    expect(retryResponse.body).toMatchObject({
+      received: true,
+      duplicate: false,
+      deliveryId: retryDeliveryId
+    });
+
+    // Confirm that the retry successfully persisted exactly one event.
+    const rowsAfterRetry = await db
+      .select()
+      .from(githubEvents)
+      .where(eq(githubEvents.deliveryId, retryDeliveryId));
+
+    expect(rowsAfterRetry).toHaveLength(1);
+
+    expect(rowsAfterRetry[0]).toMatchObject({
+      deliveryId: retryDeliveryId,
       eventName: "push",
       repositoryId: "987654321",
       repositoryFullName: "commitopsy-integration/idempotency-test"
