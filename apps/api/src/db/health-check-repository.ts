@@ -1,11 +1,18 @@
-
+import { eq } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema.js";
 import {
   healthCheckResults,
+  monitoredEndpoints,
   type HealthCheckOutcome
 } from "./schema.js";
+
+export interface MonitoredEndpointForHealthCheck {
+  id: number;
+  url: string;
+  enabled: boolean;
+}
 
 export interface NewHealthCheckResult {
   endpointId: number;
@@ -18,16 +25,42 @@ export interface NewHealthCheckResult {
 export type SavedHealthCheckResult =
   typeof healthCheckResults.$inferSelect;
 
+export interface HealthCheckExecutionRepository {
+  findEndpointById(
+    endpointId: number
+  ): Promise<MonitoredEndpointForHealthCheck | null>;
+
+  saveResult(
+    result: NewHealthCheckResult
+  ): Promise<SavedHealthCheckResult>;
+}
+
 /**
- * Persists health-check attempts against registered endpoints.
- *
- * This repository does not execute HTTP requests or schedule checks.
- * PostgreSQL remains responsible for generating the ID and checkedAt.
+ * Loads monitored endpoints and persists health-check observations.
+ * HTTP execution and scheduling belong to other components.
  */
-export class DrizzleHealthCheckRepository {
+export class DrizzleHealthCheckRepository
+  implements HealthCheckExecutionRepository
+{
   constructor(
     private readonly db: NodePgDatabase<typeof schema>
   ) {}
+
+  async findEndpointById(
+    endpointId: number
+  ): Promise<MonitoredEndpointForHealthCheck | null> {
+    const [endpoint] = await this.db
+      .select({
+        id: monitoredEndpoints.id,
+        url: monitoredEndpoints.url,
+        enabled: monitoredEndpoints.enabled
+      })
+      .from(monitoredEndpoints)
+      .where(eq(monitoredEndpoints.id, endpointId))
+      .limit(1);
+
+    return endpoint ?? null;
+  }
 
   async saveResult(
     result: NewHealthCheckResult
