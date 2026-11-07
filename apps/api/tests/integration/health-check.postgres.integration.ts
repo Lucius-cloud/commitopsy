@@ -72,7 +72,111 @@ describe("Health-check PostgreSQL integration", () => {
     } finally {
       await pool.end();
     }
+  
   });
+  it("selects only enabled endpoints whose check interval has elapsed", async () => {
+  const created = await db
+    .insert(monitoredEndpoints)
+    .values([
+      {
+        name: "Due endpoint never checked",
+        url: `https://${randomUUID()}.example.invalid/health`,
+        intervalSeconds: 30,
+        enabled: true
+      },
+      {
+        name: "Endpoint checked recently",
+        url: `https://${randomUUID()}.example.invalid/health`,
+        intervalSeconds: 30,
+        enabled: true
+      },
+      {
+        name: "Endpoint overdue",
+        url: `https://${randomUUID()}.example.invalid/health`,
+        intervalSeconds: 30,
+        enabled: true
+      },
+      {
+        name: "Disabled endpoint",
+        url: `https://${randomUUID()}.example.invalid/health`,
+        intervalSeconds: 30,
+        enabled: false
+      }
+    ])
+    .returning({
+      id: monitoredEndpoints.id,
+      name: monitoredEndpoints.name
+    });
+
+  expect(created).toHaveLength(4);
+
+  const getEndpointId = (name: string): number => {
+    const endpoint = created.find((item) => item.name === name);
+
+    if (!endpoint) {
+      throw new Error(`Test endpoint not found: ${name}`);
+    }
+
+    return endpoint.id;
+  };
+
+  const endpointIds = created.map((endpoint) => endpoint.id);
+
+  try {
+    // A recent unhealthy observation still counts as a completed check.
+    await db.insert(healthCheckResults).values([
+      {
+        endpointId: getEndpointId("Endpoint checked recently"),
+        checkedAt: new Date(Date.now() - 5_000),
+        outcome: "unhealthy",
+        httpStatus: 503,
+        latencyMs: 120,
+        failureCode: "http_error"
+      },
+      {
+        endpointId: getEndpointId("Endpoint overdue"),
+        checkedAt: new Date(Date.now() - 60_000),
+        outcome: "unhealthy",
+        httpStatus: 503,
+        latencyMs: 120,
+        failureCode: "http_error"
+      }
+    ]);
+
+    const dueEndpoints = await repository.findDueEndpoints(100);
+    const dueIds = new Set(dueEndpoints.map((endpoint) => endpoint.id));
+
+    // Never-checked enabled endpoint must be due.
+    expect(
+      dueIds.has(getEndpointId("Due endpoint never checked"))
+    ).toBe(true);
+
+    // Recent observation must suppress another check.
+    expect(
+      dueIds.has(getEndpointId("Endpoint checked recently"))
+    ).toBe(false);
+
+    // An overdue endpoint must become due again.
+    expect(
+      dueIds.has(getEndpointId("Endpoint overdue"))
+    ).toBe(true);
+
+    // Disabled endpoints must never be selected.
+    expect(
+      dueIds.has(getEndpointId("Disabled endpoint"))
+    ).toBe(false);
+  } finally {
+    // Remove only records created by this test.
+    await db
+      .delete(healthCheckResults)
+      .where(inArray(healthCheckResults.endpointId, endpointIds));
+
+    await db
+      .delete(monitoredEndpoints)
+      .where(inArray(monitoredEndpoints.id, endpointIds));
+  }
+});
+
 
   it("persists healthy and unhealthy results for a monitored endpoint", async () => {
     const endpoints = await db
